@@ -7,7 +7,6 @@ import (
 
 	model "github.com/cloudreve/Cloudreve/v3/models"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem"
-	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/driver/local"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/fsctx"
 	"github.com/cloudreve/Cloudreve/v3/pkg/util"
 )
@@ -82,7 +81,7 @@ func (job *ImportTask) Do() {
 	// 查找存储策略
 	policy, err := model.GetPolicyByID(job.TaskProps.PolicyID)
 	if err != nil {
-		job.SetErrorMsg("找不到存储策略", err)
+		job.SetErrorMsg("Policy not exist.", err)
 		return
 	}
 
@@ -95,10 +94,15 @@ func (job *ImportTask) Do() {
 	}
 	defer fs.Recycle()
 
+	fs.Policy = &policy
+	if err := fs.DispatchHandler(); err != nil {
+		job.SetErrorMsg("Failed to dispatch policy.", err)
+		return
+	}
+
 	// 注册钩子
 	fs.Use("BeforeAddFile", filesystem.HookValidateFile)
 	fs.Use("BeforeAddFile", filesystem.HookValidateCapacity)
-	fs.Use("AfterValidateFailed", filesystem.HookGiveBackCapacity)
 
 	// 列取目录、对象
 	job.TaskModel.SetProgress(ListingProgress)
@@ -106,7 +110,7 @@ func (job *ImportTask) Do() {
 		true)
 	objects, err := fs.Handler.List(ctx, job.TaskProps.Src, job.TaskProps.Recursive)
 	if err != nil {
-		job.SetErrorMsg("无法列取文件", err)
+		job.SetErrorMsg("Failed to list files.", err)
 		return
 	}
 
@@ -122,7 +126,7 @@ func (job *ImportTask) Do() {
 			virtualPath := path.Join(job.TaskProps.Dst, object.RelativePath)
 			folder, err := fs.CreateDirectory(coxIgnoreConflict, virtualPath)
 			if err != nil {
-				util.Log().Warning("导入任务无法创建用户目录[%s], %s", virtualPath, err)
+				util.Log().Warning("Importing task cannot create user directory %q: %s", virtualPath, err)
 			} else if folder.ID > 0 {
 				pathCache[virtualPath] = folder
 			}
@@ -134,40 +138,35 @@ func (job *ImportTask) Do() {
 		if !object.IsDir {
 			// 创建文件信息
 			virtualPath := path.Dir(path.Join(job.TaskProps.Dst, object.RelativePath))
-			fileHeader := local.FileStream{
+			fileHeader := fsctx.FileStream{
 				Size:        object.Size,
 				VirtualPath: virtualPath,
 				Name:        object.Name,
+				SavePath:    object.Source,
 			}
-			addFileCtx := context.WithValue(ctx, fsctx.FileHeaderCtx, fileHeader)
-			addFileCtx = context.WithValue(addFileCtx, fsctx.SavePathCtx, object.Source)
 
 			// 查找父目录
 			parentFolder := &model.Folder{}
 			if parent, ok := pathCache[virtualPath]; ok {
 				parentFolder = parent
 			} else {
-				exist, folder := fs.IsPathExist(virtualPath)
-				if exist {
-					parentFolder = folder
-				} else {
-					folder, err := fs.CreateDirectory(context.Background(), virtualPath)
-					if err != nil {
-						util.Log().Warning("导入任务无法创建用户目录[%s], %s",
-							virtualPath, err)
-						continue
-					}
-					parentFolder = folder
+				folder, err := fs.CreateDirectory(context.Background(), virtualPath)
+				if err != nil {
+					util.Log().Warning("Importing task cannot create user directory %q: %s",
+						virtualPath, err)
+					continue
 				}
+				parentFolder = folder
+
 			}
 
 			// 插入文件记录
-			_, err := fs.AddFile(addFileCtx, parentFolder)
+			_, err := fs.AddFile(context.Background(), parentFolder, &fileHeader)
 			if err != nil {
-				util.Log().Warning("导入任务无法创插入文件[%s], %s",
+				util.Log().Warning("Importing task cannot insert user file %q: %s",
 					object.RelativePath, err)
 				if err == filesystem.ErrInsufficientCapacity {
-					job.SetErrorMsg("容量不足", err)
+					job.SetErrorMsg("Insufficient storage capacity.", err)
 					return
 				}
 			}

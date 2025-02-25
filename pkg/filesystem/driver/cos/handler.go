@@ -17,10 +17,12 @@ import (
 	"time"
 
 	model "github.com/cloudreve/Cloudreve/v3/models"
+	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/driver"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/fsctx"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/response"
 	"github.com/cloudreve/Cloudreve/v3/pkg/request"
 	"github.com/cloudreve/Cloudreve/v3/pkg/serializer"
+	"github.com/cloudreve/Cloudreve/v3/pkg/util"
 	"github.com/google/go-querystring/query"
 	cossdk "github.com/tencentyun/cos-go-sdk-v5"
 )
@@ -148,14 +150,7 @@ func (handler Driver) CORS() error {
 // Get 获取文件
 func (handler Driver) Get(ctx context.Context, path string) (response.RSCloser, error) {
 	// 获取文件源地址
-	downloadURL, err := handler.Source(
-		ctx,
-		path,
-		url.URL{},
-		int64(model.GetIntSetting("preview_timeout", 60)),
-		false,
-		0,
-	)
+	downloadURL, err := handler.Source(ctx, path, int64(model.GetIntSetting("preview_timeout", 60)), false, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -183,9 +178,11 @@ func (handler Driver) Get(ctx context.Context, path string) (response.RSCloser, 
 }
 
 // Put 将文件流保存到指定目录
-func (handler Driver) Put(ctx context.Context, file io.ReadCloser, dst string, size uint64) error {
+func (handler Driver) Put(ctx context.Context, file fsctx.FileHeader) error {
+	defer file.Close()
+
 	opt := &cossdk.ObjectPutOptions{}
-	_, err := handler.Client.Object.Put(ctx, dst, file, opt)
+	_, err := handler.Client.Object.Put(ctx, file.Info().SavePath, file, opt)
 	return err
 }
 
@@ -216,23 +213,37 @@ func (handler Driver) Delete(ctx context.Context, files []string) ([]string, err
 		return failed, nil
 	}
 
-	return failed, errors.New("删除失败")
+	return failed, errors.New("delete failed")
 }
 
 // Thumb 获取文件缩略图
-func (handler Driver) Thumb(ctx context.Context, path string) (*response.ContentResponse, error) {
+func (handler Driver) Thumb(ctx context.Context, file *model.File) (*response.ContentResponse, error) {
+	// quick check by extension name
+	// https://cloud.tencent.com/document/product/436/44893
+	supported := []string{"png", "jpg", "jpeg", "gif", "bmp", "webp", "heif", "heic"}
+	if len(handler.Policy.OptionsSerialized.ThumbExts) > 0 {
+		supported = handler.Policy.OptionsSerialized.ThumbExts
+	}
+
+	if !util.IsInExtensionList(supported, file.Name) || file.Size > (32<<(10*2)) {
+		return nil, driver.ErrorThumbNotSupported
+	}
+
 	var (
 		thumbSize = [2]uint{400, 300}
 		ok        = false
 	)
 	if thumbSize, ok = ctx.Value(fsctx.ThumbSizeCtx).([2]uint); !ok {
-		return nil, errors.New("无法获取缩略图尺寸设置")
+		return nil, errors.New("failed to get thumbnail size")
 	}
-	thumbParam := fmt.Sprintf("imageMogr2/thumbnail/%dx%d", thumbSize[0], thumbSize[1])
+
+	thumbEncodeQuality := model.GetIntSetting("thumb_encode_quality", 85)
+
+	thumbParam := fmt.Sprintf("imageMogr2/thumbnail/%dx%d/quality/%d", thumbSize[0], thumbSize[1], thumbEncodeQuality)
 
 	source, err := handler.signSourceURL(
 		ctx,
-		path,
+		file.SourceName,
 		int64(model.GetIntSetting("preview_timeout", 60)),
 		&urlOption{},
 	)
@@ -252,14 +263,7 @@ func (handler Driver) Thumb(ctx context.Context, path string) (*response.Content
 }
 
 // Source 获取外链URL
-func (handler Driver) Source(
-	ctx context.Context,
-	path string,
-	baseURL url.URL,
-	ttl int64,
-	isDownload bool,
-	speed int,
-) (string, error) {
+func (handler Driver) Source(ctx context.Context, path string, ttl int64, isDownload bool, speed int) (string, error) {
 	// 尝试从上下文获取文件名
 	fileName := ""
 	if file, ok := ctx.Value(fsctx.FileModelCtx).(model.File); ok {
@@ -324,21 +328,16 @@ func (handler Driver) signSourceURL(ctx context.Context, path string, ttl int64,
 }
 
 // Token 获取上传策略和认证Token
-func (handler Driver) Token(ctx context.Context, TTL int64, key string) (serializer.UploadCredential, error) {
-	// 读取上下文中生成的存储路径
-	savePath, ok := ctx.Value(fsctx.SavePathCtx).(string)
-	if !ok {
-		return serializer.UploadCredential{}, errors.New("无法获取存储路径")
-	}
-
+func (handler Driver) Token(ctx context.Context, ttl int64, uploadSession *serializer.UploadSession, file fsctx.FileHeader) (*serializer.UploadCredential, error) {
 	// 生成回调地址
 	siteURL := model.GetSiteURL()
-	apiBaseURI, _ := url.Parse("/api/v3/callback/cos/" + key)
+	apiBaseURI, _ := url.Parse("/api/v3/callback/cos/" + uploadSession.Key)
 	apiURL := siteURL.ResolveReference(apiBaseURI).String()
 
 	// 上传策略
+	savePath := file.Info().SavePath
 	startTime := time.Now()
-	endTime := startTime.Add(time.Duration(TTL) * time.Second)
+	endTime := startTime.Add(time.Duration(ttl) * time.Second)
 	keyTime := fmt.Sprintf("%d;%d", startTime.Unix(), endTime.Unix())
 	postPolicy := UploadPolicy{
 		Expiration: endTime.UTC().Format(time.RFC3339),
@@ -346,7 +345,7 @@ func (handler Driver) Token(ctx context.Context, TTL int64, key string) (seriali
 			map[string]string{"bucket": handler.Policy.BucketName},
 			map[string]string{"$key": savePath},
 			map[string]string{"x-cos-meta-callback": apiURL},
-			map[string]string{"x-cos-meta-key": key},
+			map[string]string{"x-cos-meta-key": uploadSession.Key},
 			map[string]string{"q-sign-algorithm": "sha1"},
 			map[string]string{"q-ak": handler.Policy.AccessKey},
 			map[string]string{"q-sign-time": keyTime},
@@ -358,14 +357,20 @@ func (handler Driver) Token(ctx context.Context, TTL int64, key string) (seriali
 			[]interface{}{"content-length-range", 0, handler.Policy.MaxSize})
 	}
 
-	res, err := handler.getUploadCredential(ctx, postPolicy, keyTime)
+	res, err := handler.getUploadCredential(ctx, postPolicy, keyTime, savePath)
 	if err == nil {
+		res.SessionID = uploadSession.Key
 		res.Callback = apiURL
-		res.Key = key
+		res.UploadURLs = []string{handler.Policy.Server}
 	}
 
 	return res, err
 
+}
+
+// 取消上传凭证
+func (handler Driver) CancelToken(ctx context.Context, uploadSession *serializer.UploadSession) error {
+	return nil
 }
 
 // Meta 获取文件信息
@@ -381,17 +386,11 @@ func (handler Driver) Meta(ctx context.Context, path string) (*MetaData, error) 
 	}, nil
 }
 
-func (handler Driver) getUploadCredential(ctx context.Context, policy UploadPolicy, keyTime string) (serializer.UploadCredential, error) {
-	// 读取上下文中生成的存储路径
-	savePath, ok := ctx.Value(fsctx.SavePathCtx).(string)
-	if !ok {
-		return serializer.UploadCredential{}, errors.New("无法获取存储路径")
-	}
-
+func (handler Driver) getUploadCredential(ctx context.Context, policy UploadPolicy, keyTime string, savePath string) (*serializer.UploadCredential, error) {
 	// 编码上传策略
 	policyJSON, err := json.Marshal(policy)
 	if err != nil {
-		return serializer.UploadCredential{}, err
+		return nil, err
 	}
 	policyEncoded := base64.StdEncoding.EncodeToString(policyJSON)
 
@@ -399,14 +398,14 @@ func (handler Driver) getUploadCredential(ctx context.Context, policy UploadPoli
 	hmacSign := hmac.New(sha1.New, []byte(handler.Policy.SecretKey))
 	_, err = io.WriteString(hmacSign, keyTime)
 	if err != nil {
-		return serializer.UploadCredential{}, err
+		return nil, err
 	}
 	signKey := fmt.Sprintf("%x", hmacSign.Sum(nil))
 
 	sha1Sign := sha1.New()
 	_, err = sha1Sign.Write(policyJSON)
 	if err != nil {
-		return serializer.UploadCredential{}, err
+		return nil, err
 	}
 	stringToSign := fmt.Sprintf("%x", sha1Sign.Sum(nil))
 
@@ -414,15 +413,15 @@ func (handler Driver) getUploadCredential(ctx context.Context, policy UploadPoli
 	hmacFinalSign := hmac.New(sha1.New, []byte(signKey))
 	_, err = hmacFinalSign.Write([]byte(stringToSign))
 	if err != nil {
-		return serializer.UploadCredential{}, err
+		return nil, err
 	}
 	signature := hmacFinalSign.Sum(nil)
 
-	return serializer.UploadCredential{
-		Policy:    policyEncoded,
-		Path:      savePath,
-		AccessKey: handler.Policy.AccessKey,
-		Token:     fmt.Sprintf("%x", signature),
-		KeyTime:   keyTime,
+	return &serializer.UploadCredential{
+		Policy:     policyEncoded,
+		Path:       savePath,
+		AccessKey:  handler.Policy.AccessKey,
+		Credential: fmt.Sprintf("%x", signature),
+		KeyTime:    keyTime,
 	}, nil
 }
